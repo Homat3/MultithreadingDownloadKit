@@ -1,10 +1,13 @@
 package com.infinomat.downloader
 
 import kotlinx.coroutines.*
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
 import java.io.RandomAccessFile
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -18,7 +21,10 @@ class Downloader(val threadCount: Int = 4) {
     /**
      * Http 客户端内核
      */
-    private val client = OkHttpClient()
+    private val client = HttpClient.newBuilder()
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .connectTimeout(Duration.ofSeconds(30))
+        .build()
 
     /**
      * 当前下载状态
@@ -81,19 +87,22 @@ class Downloader(val threadCount: Int = 4) {
             listener.onStart()
 
             // 1. Get content length and check range support
-            val headRequest = Request.Builder().url(request.url).head().build()
+            val headRequest = HttpRequest.newBuilder()
+                .uri(URI.create(request.url))
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build()
+
             val response = withContext(Dispatchers.IO) {
-                client.newCall(headRequest).execute()
+                client.send(headRequest, HttpResponse.BodyHandlers.discarding())
             }
 
-            if (!response.isSuccessful) {
+            if (response.statusCode() !in 200..299) {
                 status = DownloadStatus.FAILED
-                throw Exception("Failed to connect: ${response.code}")
+                throw Exception("Failed to connect: ${response.statusCode()}")
             }
 
-            val contentLength = response.header("Content-Length")?.toLongOrNull() ?: -1L
-            val acceptRanges = response.header("Accept-Ranges") == "bytes"
-            response.close()
+            val contentLength = response.headers().firstValue("Content-Length").orElse(null)?.toLongOrNull() ?: -1L
+            val acceptRanges = response.headers().firstValue("Accept-Ranges").orElse("") == "bytes"
 
             if (status == DownloadStatus.PAUSED) return@coroutineScope
 
@@ -166,26 +175,28 @@ class Downloader(val threadCount: Int = 4) {
      */
     private suspend fun downloadSingleThread(request: DownloadRequest, listener: DownloadListener, startOffset: Long) {
         withContext(Dispatchers.IO) {
-            val reqBuilder = Request.Builder().url(request.url)
+            val reqBuilder = HttpRequest.newBuilder().uri(URI.create(request.url))
             if (startOffset > 0) {
                 reqBuilder.header("Range", "bytes=$startOffset-")
             }
             val req = reqBuilder.build()
             
-            client.newCall(req).execute().use { response ->
-                if (!response.isSuccessful) throw Exception("Failed to download: ${response.code}")
-                
-                val body = response.body ?: throw Exception("No body")
-                val total = body.contentLength() + startOffset // Total is remaining + start
-                var downloaded = startOffset
-                
-                val buffer = ByteArray(8192)
-                val inputStream = body.byteStream()
-                val outputStream = RandomAccessFile(request.destination, "rw")
-                outputStream.seek(startOffset)
-                
-                outputStream.use { out ->
-                    var bytesRead = inputStream.read(buffer)
+            val response = client.send(req, HttpResponse.BodyHandlers.ofInputStream())
+            
+            if (response.statusCode() !in 200..299) throw Exception("Failed to download: ${response.statusCode()}")
+            
+            val inputStream = response.body()
+            val remainingLength = response.headers().firstValue("Content-Length").orElse("0").toLong()
+            val total = remainingLength + startOffset 
+            var downloaded = startOffset
+            
+            val buffer = ByteArray(8192)
+            val outputStream = RandomAccessFile(request.destination, "rw")
+            outputStream.seek(startOffset)
+            
+            outputStream.use { out ->
+                inputStream.use { input ->
+                    var bytesRead = input.read(buffer)
                     while (bytesRead >= 0) {
                         if (status == DownloadStatus.PAUSED) {
                             chunkProgress[0] = downloaded
@@ -195,16 +206,11 @@ class Downloader(val threadCount: Int = 4) {
                         downloaded += bytesRead
                         chunkProgress[0] = downloaded
                         
-                        // Note: total might be unknown (-1) if server doesn't send content-length for range
-                        // But we passed contentLength from outside usually.
-                        // Here we use body.contentLength() which is partial.
-                        // Let's just report progress.
-                        // If total is -1, we can't report percent accurately.
                         if (total > 0) {
                             val percent = ((downloaded * 100) / total).toInt()
                             listener.onProgress(downloaded, total, percent)
                         }
-                        bytesRead = inputStream.read(buffer)
+                        bytesRead = input.read(buffer)
                     }
                 }
             }
@@ -265,21 +271,22 @@ class Downloader(val threadCount: Int = 4) {
         listener: DownloadListener,
         chunkIndex: Int
     ) {
-        val req = Request.Builder()
-            .url(url)
+        val req = HttpRequest.newBuilder()
+            .uri(URI.create(url))
             .header("Range", "bytes=$start-$end")
             .build()
 
-        client.newCall(req).execute().use { response ->
-            if (!response.isSuccessful) throw Exception("Chunk download failed: ${response.code}")
+        val response = client.send(req, HttpResponse.BodyHandlers.ofInputStream())
+        
+        if (response.statusCode() !in 200..299) throw Exception("Chunk download failed: ${response.statusCode()}")
 
-            val body = response.body ?: throw Exception("No chunk body")
-            val inputStream = body.byteStream()
-            
-            RandomAccessFile(file, "rw").use { raf ->
-                raf.seek(start)
-                val buffer = ByteArray(8192)
-                var bytesRead = inputStream.read(buffer)
+        val inputStream = response.body()
+        
+        RandomAccessFile(file, "rw").use { raf ->
+            raf.seek(start)
+            val buffer = ByteArray(8192)
+            inputStream.use { input ->
+                var bytesRead = input.read(buffer)
                 while (bytesRead >= 0) {
                     if (status == DownloadStatus.PAUSED) {
                         return@use
@@ -287,19 +294,12 @@ class Downloader(val threadCount: Int = 4) {
                     raf.write(buffer, 0, bytesRead)
                     
                     // Update chunk progress
-                    val currentChunkDownloaded = (raf.filePointer - (start - (chunkProgress[chunkIndex] ?: 0))) // This logic is tricky
-                    // Easier: track bytes read in this session and add to existing
-                    // But we need absolute progress for resume.
-                    // chunkProgress stores "how many bytes downloaded for this chunk from its start"
-                    // So:
-                    val bytesInThisSession = bytesRead.toLong() // Wait, we need to accumulate
-                    // Let's just update chunkProgress by adding bytesRead
                     chunkProgress.compute(chunkIndex) { _, v -> (v ?: 0) + bytesRead }
                     
                     val currentTotal = downloadedTotal.addAndGet(bytesRead.toLong())
                     val percent = ((currentTotal * 100) / totalLength).toInt()
                     listener.onProgress(currentTotal, totalLength, percent)
-                    bytesRead = inputStream.read(buffer)
+                    bytesRead = input.read(buffer)
                 }
             }
         }
